@@ -5,14 +5,34 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
 
+from src.auth import (
+    SESSION_COOKIE_NAME,
+    SESSION_TTL_SECONDS,
+    CredentialStoreError,
+    create_teacher_session,
+    get_teacher_session,
+    load_teacher_hashes,
+    require_teacher,
+    remove_teacher_session,
+    verify_password,
+    secure_session_cookie,
+)
+
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+
+class TeacherLogin(BaseModel):
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,9 +108,63 @@ def get_activities():
     return activities
 
 
+@app.get("/auth/me")
+def get_auth_status(request: Request):
+    username = get_teacher_session(request)
+    return {"authenticated": username is not None, "username": username}
+
+
+@app.post("/auth/login")
+def login_teacher(credentials: TeacherLogin, response: Response):
+    username = credentials.username.strip()
+    try:
+        teacher_hashes = load_teacher_hashes()
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher accounts are not configured. Run `python -m src.manage_teachers set <username>`.",
+        ) from exc
+    except CredentialStoreError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Teacher account configuration is invalid.",
+        ) from exc
+
+    password_hash = teacher_hashes.get(username)
+    if not password_hash or not verify_password(credentials.password, password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    session_token = create_teacher_session(username)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=secure_session_cookie(),
+        samesite="lax",
+        path="/",
+    )
+    return {"username": username}
+
+
+@app.post("/auth/logout")
+def logout_teacher(request: Request, response: Response):
+    remove_teacher_session(request.cookies.get(SESSION_COOKIE_NAME))
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=secure_session_cookie(),
+        samesite="lax",
+        path="/",
+    )
+    return {"message": "Signed out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +185,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
